@@ -1,0 +1,10 @@
+# Build artifacts
+release.zip
+
+# System files
+.DS_Store
+Thumbs.db
+._*
+
+# Logs
+*.log
