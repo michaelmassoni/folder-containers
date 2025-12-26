@@ -8,10 +8,7 @@ Automatically open bookmarks from specific folders in their assigned Firefox Con
 - **Privacy Focused**: No data collection. All configurations are stored locally.
 
 ## Installation
-1. Download the latest release.
-2. Open Firefox and navigate to `about:addons`.
-3. Click the gear icon > "Install Add-on From File...".
-4. Select the `.zip` or `.xpi` file.
+Extension is currently awaiting review from Mozilla Developer Hub. Once approved, a link will be provided here to install the extension.
 
 ## Development
 This extension uses the WebExtensions API.
