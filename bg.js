@@ -142,18 +142,26 @@ async function getMappedContainerForBookmark(bookmarkId) {
     return null;
 }
 
-// Navigation Handler
-browser.webNavigation.onCommitted.addListener(async (details) => {
-    // Determine if we should check this navigation
-    // We strictly ignore reloads to prevent potential loops or annoyance
-    if (details.transitionType === "reload") return;
+// Helper to get tab details with retries, as tab might not be fully initialized in onBeforeNavigate
+async function getTabWithRetry(tabId, retries = 10, delay = 20) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            const tab = await browser.tabs.get(tabId);
+            if (tab) return tab;
+        } catch (e) {
+            if (i === retries - 1) throw e;
+        }
+        await new Promise(resolve => setTimeout(resolve, delay));
+    }
+}
 
+// Navigation Handler
+browser.webNavigation.onBeforeNavigate.addListener(async (details) => {
     // We only care about main frame navigations
     if (details.frameId !== 0) return;
 
-    // Note: We originally checked for 'auto_bookmark', but some contexts (sidebar, library, etc.)
-    // might fire different types. Since the user wants mapped bookmarks to ALWAYS open in the container,
-    // checking if the URL matches a mapped bookmark is the robust source of truth.
+    // Ignore invalid tabId
+    if (details.tabId === undefined || details.tabId === -1) return;
 
     const url = details.url;
     // Helper to find bookmark by URL
@@ -166,23 +174,33 @@ browser.webNavigation.onCommitted.addListener(async (details) => {
 
         if (targetCookieStoreId) {
             // Found a mapped container for this URL
-            const tab = await browser.tabs.get(details.tabId);
+            let tab;
+            try {
+                tab = await getTabWithRetry(details.tabId);
+            } catch (e) {
+                console.error("Folder Containers: Failed to get tab details after retries:", e);
+                return;
+            }
 
             // If already in the correct container, do nothing
             if (tab.cookieStoreId === targetCookieStoreId) {
                 return;
             }
 
-            // Reopen in correct container
-            await browser.tabs.create({
-                url: url,
-                cookieStoreId: targetCookieStoreId,
-                index: tab.index + 1,
-                active: true
-            });
+            try {
+                // Reopen in correct container
+                await browser.tabs.create({
+                    url: url,
+                    cookieStoreId: targetCookieStoreId,
+                    index: tab.index + 1,
+                    active: true
+                });
 
-            // Close the old tab (the one that opened in the wrong container)
-            await browser.tabs.remove(details.tabId);
+                // Close the old tab (the one that opened in the wrong container)
+                await browser.tabs.remove(details.tabId);
+            } catch (err) {
+                console.error("Folder Containers: Error during tab create/remove:", err);
+            }
 
             // Stop checking other bookmarks (first match wins)
             break;
