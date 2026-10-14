@@ -119,7 +119,114 @@ browser.menus.onClicked.addListener(async (info, tab) => {
         await browser.storage.local.set({ [bookmarkId]: cookieStoreId });
         console.log(`Mapped bookmarkId: ${bookmarkId} to ${cookieStoreId}`);
     }
+
+    scheduleTagSync();
 });
+
+// Bookmark tagging
+//
+// Firefox doesn't tell extensions which bookmark was clicked, only which URL is loading.
+// To support the same URL in folders mapped to different containers, every bookmark
+// under a mapped folder gets a marker in its URL fragment identifying the bookmark,
+// e.g. https://login.microsoft.com/#fc-bm=<bookmarkId>. The navigation handler reads
+// the marker, picks that bookmark's container and loads the URL without the marker.
+const TAG_KEY = "fc-bm";
+const TAG_REGEX = new RegExp(`[#&]${TAG_KEY}=([\\w-]+)$`);
+
+function parseTag(url) {
+    const match = url.match(TAG_REGEX);
+    if (!match) return { bookmarkId: null, cleanUrl: url };
+    return { bookmarkId: match[1], cleanUrl: url.slice(0, match.index) };
+}
+
+function addTag(url, bookmarkId) {
+    return `${url}${url.includes("#") ? "&" : "#"}${TAG_KEY}=${bookmarkId}`;
+}
+
+function isTaggableUrl(url) {
+    return /^https?:\/\//i.test(url);
+}
+
+// Clean URL -> Set of cookieStoreIds of mapped bookmarks with that URL.
+// Used for navigations that don't come from a tagged bookmark (e.g. typed URLs).
+let urlContainerIndex = new Map();
+
+let tagSyncRunning = false;
+let tagSyncPending = false;
+let tagSyncTimer = null;
+
+function scheduleTagSync() {
+    clearTimeout(tagSyncTimer);
+    tagSyncTimer = setTimeout(syncTags, 250);
+}
+
+// Walk the whole bookmark tree: tag bookmarks that resolve to a container, untag the rest.
+// Idempotent, so the onChanged events caused by our own updates settle immediately.
+async function syncTags() {
+    if (tagSyncRunning) {
+        tagSyncPending = true;
+        return;
+    }
+    tagSyncRunning = true;
+
+    try {
+        const storage = await browser.storage.local.get();
+        const [root] = await browser.bookmarks.getTree();
+        const index = new Map();
+        const updates = [];
+
+        const walk = (node, inherited) => {
+            const container = storage[node.id] || inherited;
+
+            if (node.url) {
+                const { cleanUrl } = parseTag(node.url);
+                const wanted = container && isTaggableUrl(cleanUrl)
+                    ? addTag(cleanUrl, node.id)
+                    : cleanUrl;
+
+                if (wanted !== node.url) {
+                    updates.push({ id: node.id, url: wanted });
+                }
+                if (container) {
+                    if (!index.has(cleanUrl)) index.set(cleanUrl, new Set());
+                    index.get(cleanUrl).add(container);
+                }
+            }
+
+            for (const child of node.children || []) {
+                walk(child, container);
+            }
+        };
+        walk(root, null);
+
+        urlContainerIndex = index;
+
+        for (const { id, url } of updates) {
+            try {
+                await browser.bookmarks.update(id, { url });
+            } catch (e) {
+                console.error(`Folder Containers: Failed to update bookmark ${id}:`, e);
+            }
+        }
+        if (updates.length) {
+            console.log(`Folder Containers: Updated tags on ${updates.length} bookmark(s).`);
+        }
+    } catch (e) {
+        console.error("Folder Containers: Tag sync failed:", e);
+    } finally {
+        tagSyncRunning = false;
+        if (tagSyncPending) {
+            tagSyncPending = false;
+            scheduleTagSync();
+        }
+    }
+}
+
+browser.bookmarks.onCreated.addListener(scheduleTagSync);
+browser.bookmarks.onChanged.addListener(scheduleTagSync);
+browser.bookmarks.onMoved.addListener(scheduleTagSync);
+browser.bookmarks.onRemoved.addListener(scheduleTagSync);
+syncTags();
 
 // Helper: Check if a bookmark node or its ancestors are mapped to a container
 async function getMappedContainerForBookmark(bookmarkId) {
@@ -163,47 +270,56 @@ browser.webNavigation.onBeforeNavigate.addListener(async (details) => {
     // Ignore invalid tabId
     if (details.tabId === undefined || details.tabId === -1) return;
 
-    const url = details.url;
-    // Helper to find bookmark by URL
-    const bookmarks = await browser.bookmarks.search({ url });
+    const { bookmarkId, cleanUrl } = parseTag(details.url);
 
-    if (bookmarks.length === 0) return;
-
-    for (const bookmark of bookmarks) {
-        const targetCookieStoreId = await getMappedContainerForBookmark(bookmark.id);
-
-        if (targetCookieStoreId) {
-            // Found a mapped container for this URL
-            let tab;
-            try {
-                tab = await getTabWithRetry(details.tabId);
-            } catch (e) {
-                console.error("Folder Containers: Failed to get tab details after retries:", e);
-                return;
-            }
-
-            // If already in the correct container, do nothing
-            if (tab.cookieStoreId === targetCookieStoreId) {
-                return;
-            }
-
-            try {
-                // Reopen in correct container
-                await browser.tabs.create({
-                    url: url,
-                    cookieStoreId: targetCookieStoreId,
-                    index: tab.index + 1,
-                    active: true
-                });
-
-                // Close the old tab (the one that opened in the wrong container)
-                await browser.tabs.remove(details.tabId);
-            } catch (err) {
-                console.error("Folder Containers: Error during tab create/remove:", err);
-            }
-
-            // Stop checking other bookmarks (first match wins)
-            break;
+    let targetCookieStoreId = null;
+    if (bookmarkId) {
+        // Opened from a tagged bookmark: its own folder decides the container
+        targetCookieStoreId = await getMappedContainerForBookmark(bookmarkId);
+    }
+    if (!targetCookieStoreId) {
+        // Untagged (e.g. typed URL): only redirect if every mapped bookmark agrees
+        const containers = urlContainerIndex.get(cleanUrl);
+        if (containers && containers.size === 1) {
+            [targetCookieStoreId] = containers;
         }
+    }
+
+    if (!targetCookieStoreId) {
+        if (bookmarkId) {
+            await browser.tabs.update(details.tabId, { url: cleanUrl, loadReplace: true }).catch(() => {});
+        }
+        return;
+    }
+
+    let tab;
+    try {
+        tab = await getTabWithRetry(details.tabId);
+    } catch (e) {
+        console.error("Folder Containers: Failed to get tab details after retries:", e);
+        return;
+    }
+
+    // Already in the correct container: just drop the tag from the URL
+    if (tab.cookieStoreId === targetCookieStoreId) {
+        if (bookmarkId) {
+            await browser.tabs.update(details.tabId, { url: cleanUrl, loadReplace: true }).catch(() => {});
+        }
+        return;
+    }
+
+    try {
+        // Reopen in correct container
+        await browser.tabs.create({
+            url: cleanUrl,
+            cookieStoreId: targetCookieStoreId,
+            index: tab.index + 1,
+            active: true
+        });
+
+        // Close the old tab (the one that opened in the wrong container)
+        await browser.tabs.remove(details.tabId);
+    } catch (err) {
+        console.error("Folder Containers: Error during tab create/remove:", err);
     }
 });
